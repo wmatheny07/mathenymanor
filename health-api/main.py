@@ -17,8 +17,8 @@ app = FastAPI()
 
 # Configure Minio client
 minio_client = Minio(
-    "minios3.mathenymanor.com",  # Minio server URL (e.g., "localhost:9000")
-    access_key="FfQWUCsESF86WyA6qnrx",  # Replace with your Minio access key
+    "minios3.peakprecisiondata.com",  # Minio server URL (e.g., "localhost:9000")
+    access_key="os.environ['MINIO_ACCESS_KEY]",  # Replace with your Minio access key
     secret_key=os.environ['MINIO_SECRET_KEY'],  # Replace with your Minio secret key
     secure=True  # Set to True if Minio is using HTTPS
 )
