@@ -1,0 +1,151 @@
+services:
+  plex:
+    container_name: plex
+    image: linuxserver/plex:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - PLEX_CLAIM=${PLEX_CLAIM}
+      - VERSION=docker
+    volumes:
+      - /opt/plex/config:/config
+      - /media/nasdrive/plexmedia/photos:/photos
+      - /media/nasdrive/plexmedia/music:/music
+      - /media/nasdrive/plexmedia/home_video:/home_video
+      - /media/nasdrive/plexmedia/movies:/movies
+      - /media/nasdrive/plexmedia/series:/series
+    restart: unless-stopped
+    network_mode: host
+
+  health-data-db:
+    build: ./health-data-db/.
+    container_name: health-data-db
+    environment:
+      - POSTGRES_USER=${_HEALTH_DB_USER_USERNAME}
+      - POSTGRES_PASSWORD=${_HEALTH_DB_USER_PASSWORD}
+      - POSTGRES_DB=${_HEALTH_DB_NAME}
+    volumes:
+      - postgres-db-volume:/opt/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${_HEALTH_DB_USER_USERNAME}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    ports:
+      - "5434:5432"
+    restart: always
+    networks:
+      - mathenymanor
+
+  # health-data-api:
+  #   container_name: health-data-api
+  #   build: ./health-api/.
+  #   environment:
+  #     - API_KEY=${HEALTH_API_KEY}
+  #     - MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+  #     # Example: connect to Postgres by SERVICE NAME (not IP)
+  #     - DATABASE_URL=postgresql://${_HEALTH_DB_USER_USERNAME}:${_HEALTH_DB_USER_PASSWORD}@health-data-db:5432/${_HEALTH_DB_NAME}
+  #   ports:
+  #     - "8000:8000"
+  #   restart: unless-stopped
+  #   networks:
+  #     - mathenymanor
+  #   depends_on:
+  #     health-data-db:
+  #       condition: service_healthy
+
+  redis:
+    container_name: redis
+    image: redis:7.2-bookworm
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - mathenymanor
+
+  homebridge:
+    image: homebridge/homebridge:latest
+    container_name: homebridge
+    restart: always
+    volumes:
+      - ./volumes/homebridge:/homebridge
+    logging:
+      driver: json-file
+      options:
+        max-size: "10mb"
+        max-file: "1"
+    network_mode: host
+
+  rclone:
+    image: rclone/rclone:latest
+    container_name: rclone
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - /media/nasdrive/plexmedia:/data
+    command: >
+      serve webdav /data
+      --addr :8090
+      --user mathenymanor
+      --pass ${RCLONE_PASS}
+      --timeout 10m
+      --server-write-timeout 4h
+      --server-read-timeout 4h
+      --vfs-cache-mode full
+      --vfs-cache-max-size 50G
+      --vfs-cache-max-age 12h
+      --allow-origin "*"
+      --read-only=false
+    networks:
+      - mathenymanor
+
+  agent_api:
+    build: ./agent_api
+    container_name: agent-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./agent_api/:/app
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-https://agents.mathenymanor.com}
+      # If agent_api needs redis, reference it by service name:
+      # - REDIS_URL=redis://redis:6379/0
+      # If agent_api needs health db, reference it by service name:
+      # - HEALTH_DB_HOST=health-data-db
+      # - HEALTH_DB_PORT=5432
+    restart: unless-stopped
+    networks:
+      - mathenymanor
+
+  agent_web:
+    build:
+      context: ./agent_web
+      args:
+        VITE_API_URL: "https://agents.mathenymanor.com/api"
+    container_name: agent-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - agent_api
+    restart: unless-stopped
+    environment:
+      VITE_API_URL: "https://agents.mathenymanor.com/api"
+    networks:
+      - mathenymanor
+
+volumes:
+  postgres-db-volume:
+
+networks:
+  mathenymanor:
+    name: mathenymanor.docker
+    external: true
