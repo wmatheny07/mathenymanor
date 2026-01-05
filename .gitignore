@@ -5,3 +5,4 @@ dist/
 .vscode/
 *.tar.gz
 *.log
+**/volumes/
