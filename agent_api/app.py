@@ -23,12 +23,30 @@ redis_client = redis.from_url(
 )
 
 SESSION_PREFIX = "agent:caringbridge:session:"
+PROMPTASSIST_PREFIX = "agent:promptassist:session:"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 # Initialize OpenAI client
-load_dotenv(dotenv_path="/opt/config/.env")
+load_dotenv(dotenv_path="/opt/config/project/.env.mathenymanor")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+def load_session_with_prefix(prefix: str, session_id: str) -> dict:
+    key = prefix + session_id
+    raw = redis_client.get(key)
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+def save_session_with_prefix(prefix: str, session_id: str, state: dict) -> None:
+    key = prefix + session_id
+    state.setdefault(
+        "updatedAt",
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+    redis_client.setex(key, SESSION_TTL_SECONDS, json.dumps(state))
 
 def load_session(session_id: str) -> dict:
     """Load session state from Redis, or return empty dict if none."""
@@ -178,6 +196,140 @@ def get_blog_post_chunk(session_id):
         }
     ), 200
 
+@app.route("/api/agents/promptassist", methods=["POST"])
+def start_promptassist():
+    data = request.get_json() or {}
+
+    # Expect the frontend to send the final composed prompt
+    prompt = (data.get("prompt") or "").strip()
+
+    # Optional: structured fields (nice for debugging / saving)
+    persona = data.get("persona", "")
+    tone = data.get("tone", "professional")
+    request_text = data.get("request", "")
+    context = data.get("context", "")
+    constraints = data.get("constraints", "")
+    output_format = data.get("outputFormat", "")
+    ask_first = bool(data.get("askFirst", True))
+
+    session_id = data.get("sessionId") or str(uuid.uuid4())
+
+    if not prompt:
+        return jsonify({"error": "Missing 'prompt'"}), 400
+
+    # 1) Load / init session state
+    session_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id)
+
+    messages = session_state.get("messages", [])
+    messages.append({"role": "user", "content": prompt})
+    session_state["messages"] = messages
+
+    # 2) reset streaming state
+    session_state["content"] = ""
+    session_state["done"] = False
+
+    # Save inputs for transparency / debugging
+    session_state["prompt"] = prompt
+    session_state["persona"] = persona
+    session_state["tone"] = tone
+    session_state["request"] = request_text
+    session_state["context"] = context
+    session_state["constraints"] = constraints
+    session_state["outputFormat"] = output_format
+    session_state["askFirst"] = ask_first
+
+    save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, session_state)
+
+    def generate_chunks(session_id: str):
+        local_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id) or {}
+        local_messages = local_state.get("messages", [])
+
+        app.logger.info(f"[promptassist] START generation for {session_id}")
+
+        try:
+            completion = client.chat.completions.create(
+                model="gpt-5",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert prompt engineer. "
+                            "Your job is to help the user craft a single, high-quality prompt "
+                            "that will produce the best possible result from ChatGPT. "
+                            "Be practical, specific, and structured.\n\n"
+                            "Return your answer in this format:\n"
+                            "1) Improved Prompt (the exact prompt to paste into ChatGPT)\n"
+                            "2) Why this works (brief)\n"
+                            "3) Optional variations (up to 3)\n"
+                        ),
+                    },
+                    *local_messages,
+                ],
+            )
+
+            full_text = (completion.choices[0].message.content or "").strip()
+            chunk_size = 150
+            chunks = [full_text[i : i + chunk_size] for i in range(0, len(full_text), chunk_size)]
+
+            content = local_state.get("content", "")
+            app.logger.info(
+                f"[promptassist] Generated {len(full_text)} chars in {len(chunks)} chunks for {session_id}"
+            )
+
+            for idx, chunk in enumerate(chunks):
+                content += chunk
+                local_state["content"] = content
+                local_state["done"] = False
+                save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, local_state)
+
+                app.logger.info(
+                    f"[promptassist] Saved chunk {idx+1}/{len(chunks)} for {session_id} "
+                    f"(content_len={len(content)})"
+                )
+                time.sleep(0.2)
+
+            app.logger.info(f"[promptassist] FINISHED streaming for {session_id}")
+
+        except Exception as e:
+            app.logger.exception(f"[promptassist] ERROR during generation for {session_id}: {e}")
+            content = local_state.get("content", "")
+            content += f"\n\n[ERROR generating prompt assist response: {e}]"
+            local_state["content"] = content
+
+        finally:
+            app.logger.info(f"[promptassist] Marking {session_id} done=True in finally")
+            local_state["done"] = True
+            try:
+                save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, local_state)
+                app.logger.info(f"[promptassist] Saved final state for {session_id}")
+            except Exception as e:
+                app.logger.exception(f"[promptassist] FAILED to save final state for {session_id}: {e}")
+
+    threading.Thread(target=generate_chunks, args=(session_id,), daemon=True).start()
+    return jsonify({"session_id": session_id}), 200
+
+
+@app.route("/api/agents/promptassist/<session_id>", methods=["GET"])
+def get_promptassist_chunk(session_id):
+    session_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id)
+
+    if not session_state:
+        return jsonify({"content": "", "done": False, "updatedAt": None}), 200
+
+    app.logger.info(
+        f"[promptassist] GET chunk for {session_id} | done={session_state.get('done')} | "
+        f"content_len={len(session_state.get('content', ''))}"
+    )
+
+    return jsonify(
+        {
+            "content": session_state.get("content", ""),
+            "done": bool(session_state.get("done", False)),
+            "updatedAt": session_state.get("updatedAt"),
+            # Optional: return the saved prompt too (handy for UI verification)
+            "prompt": session_state.get("prompt", ""),
+        }
+    ), 200
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
