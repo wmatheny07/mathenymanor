@@ -18,25 +18,25 @@ services:
     restart: unless-stopped
     network_mode: host
 
-  health-data-db:
-    build: ./health-data-db/.
-    container_name: health-data-db
-    environment:
-      - POSTGRES_USER=${_HEALTH_DB_USER_USERNAME}
-      - POSTGRES_PASSWORD=${_HEALTH_DB_USER_PASSWORD}
-      - POSTGRES_DB=${_HEALTH_DB_NAME}
-    volumes:
-      - postgres-db-volume:/opt/postgresql/data
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${_HEALTH_DB_USER_USERNAME}"]
-      interval: 10s
-      retries: 5
-      start_period: 5s
-    ports:
-      - "5434:5432"
-    restart: always
-    networks:
-      - mathenymanor
+  # health-data-db:
+  #   build: ./health-data-db/.
+  #   container_name: health-data-db
+  #   environment:
+  #     - POSTGRES_USER=${_HEALTH_DB_USER_USERNAME}
+  #     - POSTGRES_PASSWORD=${_HEALTH_DB_USER_PASSWORD}
+  #     - POSTGRES_DB=${_HEALTH_DB_NAME}
+  #   volumes:
+  #     - postgres-db-volume:/opt/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD", "pg_isready", "-U", "${_HEALTH_DB_USER_USERNAME}"]
+  #     interval: 10s
+  #     retries: 5
+  #     start_period: 5s
+  #   ports:
+  #     - "5434:5432"
+  #   restart: always
+  #   networks:
+  #     - mathenymanor
 
   # health-data-api:
   #   container_name: health-data-api
@@ -123,6 +123,8 @@ services:
       # - HEALTH_DB_HOST=health-data-db
       # - HEALTH_DB_PORT=5432
     restart: unless-stopped
+    depends_on:
+      - redis
     networks:
       - mathenymanor
 

@@ -11,15 +11,22 @@ import redis
 import logging
 from datetime import datetime, timezone  # ✅ needed for timestamps
 
+load_dotenv(dotenv_path="/opt/config/runtime/.env.all")
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 CORS(app, resources={r"/agents/*": {"origins": "https://agents.mathenymanor.com"}})
+#CORS(app, resources={r"/api/agents/*": {"origins": "http://localhost:3001"}})
 
-# ✅ Redis client pointing at your existing instance
+# Prefer env var, but fall back to docker service name `redis`
+REDIS_URL = os.getenv("REDIS_URL") or "redis://redis:6379/0"
+
+if not REDIS_URL:
+    raise RuntimeError("REDIS_URL is not set and no default provided")
+
 redis_client = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://10.18.0.12:6379/0"),
-    decode_responses=True,  # return str instead of bytes
+    REDIS_URL,
+    decode_responses=True,
 )
 
 SESSION_PREFIX = "agent:caringbridge:session:"
@@ -27,7 +34,6 @@ PROMPTASSIST_PREFIX = "agent:promptassist:session:"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 # Initialize OpenAI client
-load_dotenv(dotenv_path="/opt/config/project/.env.mathenymanor")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 def load_session_with_prefix(prefix: str, session_id: str) -> dict:
@@ -253,14 +259,8 @@ def start_promptassist():
                     {
                         "role": "system",
                         "content": (
-                            "You are an expert prompt engineer. "
-                            "Your job is to help the user craft a single, high-quality prompt "
-                            "that will produce the best possible result from ChatGPT. "
-                            "Be practical, specific, and structured.\n\n"
-                            "Return your answer in this format:\n"
-                            "1) Improved Prompt (the exact prompt to paste into ChatGPT)\n"
-                            "2) Why this works (brief)\n"
-                            "3) Optional variations (up to 3)\n"
+                            "Please follow the upcoming guidance in providing the optimal response:\n"
+                            "No follow up questions asked, please.\n"
                         ),
                     },
                     *local_messages,
@@ -338,3 +338,5 @@ def health_check():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
+    # For testing
+    #app.run(host="0.0.0.0", port=9999, debug=True)

@@ -18,7 +18,15 @@ RUN echo ">>> VITE_API_URL = $VITE_API_URL"
 # Build with Vite
 RUN npm run build
 
+
 FROM nginx:stable-alpine
+
+# Copy built front-end
 COPY --from=build /app/dist /usr/share/nginx/html
+
+# 🔹 Copy our custom nginx config into the container
+# This replaces the default server block
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]

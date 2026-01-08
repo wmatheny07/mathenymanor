@@ -6,9 +6,9 @@ import PromptAssist from "./PromptAssist";
 console.log("render App");
 
 export default function App() {
-  /* const apiUrl = import.meta.env.VITE_API_URL; */
+  const apiUrl = import.meta.env.VITE_API_URL;
   /* For testing */
-  const apiUrl = "http://localhost:8000/api";
+  /* const apiUrl = "http://localhost:9999/api"; */
   const navigate = useNavigate();
 
   return (

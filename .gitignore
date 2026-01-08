@@ -6,3 +6,5 @@ dist/
 *.tar.gz
 *.log
 **/volumes/
+**/venv/
+**/__pycache__/

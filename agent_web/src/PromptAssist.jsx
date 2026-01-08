@@ -37,13 +37,15 @@ export default function PromptAssist({ apiUrl }) {
           ? "Bulleted list"
           : format === "steps"
           ? "Numbered steps"
-          : "Template with placeholders"
+          : format == "templates"
+          ? "Template with placeholders"
+          : "Prose format"
       }`
     );
 
-    parts.push(
-      `If anything is ambiguous, ask up to 3 clarifying questions first.`
-    );
+    // parts.push(
+    //   `If anything is ambiguous, ask up to 3 clarifying questions first.`
+    // );
 
     return parts.join("\n\n").trim();
   }, [persona, tone, request, context, constraints, format]);
@@ -169,6 +171,7 @@ export default function PromptAssist({ apiUrl }) {
                 <option value="direct">Direct</option>
                 <option value="hopeful">Hopeful</option>
                 <option value="compassionate">Compassionate</option>
+                <option value="funny">Funny</option>
               </select>
             </div>
 
@@ -219,6 +222,7 @@ export default function PromptAssist({ apiUrl }) {
                 <option value="bullets">Bullets</option>
                 <option value="steps">Numbered Steps</option>
                 <option value="template">Template</option>
+                <option value="prose">Prose</option>
               </select>
             </div>
 
@@ -245,7 +249,7 @@ export default function PromptAssist({ apiUrl }) {
                 {runPrompt ? "Prompt used for last run" : "Live preview (not yet sent)"}
               </p>
               <pre className="whitespace-pre-wrap text-sm break-words">
-                {runPrompt || prompt}
+                {runPrompt}
               </pre>
             </div>
           </div>
