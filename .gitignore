@@ -5,6 +5,6 @@ dist/
 .vscode/
 *.tar.gz
 *.log
-**/volumes/
 **/venv/
+**/volumes/
 **/__pycache__/
