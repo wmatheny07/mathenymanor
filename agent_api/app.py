@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from openai import OpenAI
+import anthropic
 import uuid
 import time
 import threading
@@ -33,8 +33,8 @@ SESSION_PREFIX = "agent:caringbridge:session:"
 PROMPTASSIST_PREFIX = "agent:promptassist:session:"
 SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize Anthropic client
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 def load_session_with_prefix(prefix: str, session_id: str) -> dict:
     key = prefix + session_id
@@ -113,22 +113,18 @@ Notes:
         app.logger.info(f"[blogpost] START generation for {session_id}")
 
         try:
-            completion = client.chat.completions.create(
-                model="gpt-5",  # or whatever you’re actually using
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are compassionate, warm, clear, and accurate. "
-                            "You help families write CaringBridge-style updates that are "
-                            "honest about the medical journey but also hopeful and grateful."
-                        ),
-                    },
-                    *local_messages,
-                ],
+            completion = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=(
+                    "You are compassionate, warm, clear, and accurate. "
+                    "You help families write CaringBridge-style updates that are "
+                    "honest about the medical journey but also hopeful and grateful."
+                ),
+                messages=local_messages,
             )
 
-            full_text = completion.choices[0].message.content.strip()
+            full_text = completion.content[0].text.strip()
             chunk_size = 150
             chunks = [
                 full_text[i : i + chunk_size]
@@ -253,21 +249,17 @@ def start_promptassist():
         app.logger.info(f"[promptassist] START generation for {session_id}")
 
         try:
-            completion = client.chat.completions.create(
-                model="gpt-5",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Please follow the upcoming guidance in providing the optimal response:\n"
-                            "No follow up questions asked, please.\n"
-                        ),
-                    },
-                    *local_messages,
-                ],
+            completion = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=(
+                    "Please follow the upcoming guidance in providing the optimal response:\n"
+                    "No follow up questions asked, please.\n"
+                ),
+                messages=local_messages,
             )
 
-            full_text = (completion.choices[0].message.content or "").strip()
+            full_text = (completion.content[0].text or "").strip()
             chunk_size = 150
             chunks = [full_text[i : i + chunk_size] for i in range(0, len(full_text), chunk_size)]
 
