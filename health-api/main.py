@@ -47,18 +47,20 @@ def api_key_auth(x_api_key: str = Depends(X_API_KEY)):
 
 # Only allow known categories
 Category = Literal["workouts", "metrics"]
+Person = Literal["wes", "amanda"]
 
-def build_object_name(category: Category, ext: str) -> str:
+def build_object_name(category: Category, person: Person, ext: str) -> str:
     ts = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     # e.g. workouts/json/auto_health_workouts_2026_01_14_13_45_00.json
-    return f"{category}/{ext}/auto_health_{category}_{ts}.{ext}"
+    return f"{category}/{ext}/{person}/auto_health_{category}_{ts}.{ext}"
 
 
 # ---------- JSON endpoint ----------
-@app.post("/health/{category}/json")
+@app.post("/health/{category}/json/{person}")
 async def upload_to_minio_json(
     category: Category,
     request: Request,
+    person: Person,
     key_valid: bool = Depends(api_key_auth),
 ):
     try:
@@ -70,7 +72,7 @@ async def upload_to_minio_json(
         ) else __import__("json").dumps(raw_data)
 
         json_bytes = BytesIO(json_data_str.encode("utf-8"))
-        object_name = build_object_name(category, "json")
+        object_name = build_object_name(category, person, "json")
 
         minio_client.put_object(
             bucket_name,
@@ -80,7 +82,7 @@ async def upload_to_minio_json(
             content_type="application/json",
         )
 
-        return {"status": "ok", "category": category, "object": object_name}
+        return {"status": "ok", "category": category, "person": person, "object": object_name}
 
     except S3Error as exc:
         raise HTTPException(status_code=500, detail=f"Minio error: {str(exc)}")
@@ -89,9 +91,10 @@ async def upload_to_minio_json(
 
 
 # ---------- CSV endpoint ----------
-@app.post("/health/{category}/csv")
+@app.post("/health/{category}/csv/{person}")
 async def upload_to_minio_csv(
     category: Category,
+    person: Person,
     request: Request,
     key_valid: bool = Depends(api_key_auth),
 ):
@@ -104,7 +107,7 @@ async def upload_to_minio_csv(
         csv_buffer = BytesIO(csv_data)
 
         ctype = request.headers.get("content-type", "text/csv")
-        object_name = build_object_name(category, "csv")
+        object_name = build_object_name(category, person, "csv")
 
         minio_client.put_object(
             bucket_name,
@@ -114,7 +117,7 @@ async def upload_to_minio_csv(
             content_type=ctype,
         )
 
-        return {"status": "ok", "category": category, "object": object_name}
+        return {"status": "ok", "category": category, "person": person, "object": object_name}
 
     except S3Error as exc:
         raise HTTPException(status_code=500, detail=f"Minio error: {str(exc)}")
