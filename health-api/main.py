@@ -13,6 +13,7 @@ from io import BytesIO
 import datetime
 import os
 import logging
+import time
 
 def build_minio_client():
     endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000").strip()
@@ -29,13 +30,29 @@ def build_minio_client():
 
 app = FastAPI()
 
-# Configure Minio clien
-minio_client = build_minio_client()
-
-# Create a bucket if it doesn't exist
+# Initialised in the startup handler below; avoids crashing at import time
+# if MinIO is not yet available.
+minio_client: Minio | None = None
 bucket_name = "health-data"
-if not minio_client.bucket_exists(bucket_name):
-    minio_client.make_bucket(bucket_name)
+
+@app.on_event("startup")
+def init_minio(max_retries: int = 12, retry_delay: int = 5) -> None:
+    """Connect to MinIO and ensure the bucket exists.  Retries so the container
+    doesn't crash-loop when MinIO is still starting up."""
+    global minio_client
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = build_minio_client()
+            if not client.bucket_exists(bucket_name):
+                client.make_bucket(bucket_name)
+            minio_client = client
+            print(f"[MinIO] Ready — bucket '{bucket_name}' confirmed")
+            return
+        except Exception as exc:
+            print(f"[MinIO] Attempt {attempt}/{max_retries} failed: {exc}")
+            if attempt == max_retries:
+                raise
+            time.sleep(retry_delay)
 
 # ---------- Auth ----------
 X_API_KEY = APIKeyHeader(name="X-API-Key")

@@ -28,21 +28,6 @@ services:
     restart: unless-stopped
     network_mode: host
 
-  redis:
-    container_name: redis
-    image: redis:7.2-bookworm
-    expose:
-      - "6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 30s
-      retries: 50
-      start_period: 30s
-    restart: always
-    networks:
-      - mathenymanor
-
   homebridge:
     image: homebridge/homebridge:latest
     container_name: homebridge
@@ -81,6 +66,31 @@ services:
     networks:
       - mathenymanor
 
+  rclone_mail:
+    user: "1000:1000"
+    image: rclone/rclone:latest
+    container_name: rclone-mail
+    restart: unless-stopped
+    ports:
+      - "8091:8091"
+    volumes:
+      - /media/nasdrive/mail_intelligence/minio/mail-raw/inbox:/data
+    command: >
+      serve webdav /data
+      --addr :8091
+      --user mailuser
+      --pass ${RCLONE_MAIL_PASS}
+      --timeout 10m
+      --server-write-timeout 4h
+      --server-read-timeout 4h
+      --vfs-cache-mode full
+      --vfs-cache-max-size 10G
+      --vfs-cache-max-age 12h
+      --allow-origin "*"
+      --read-only=false
+    networks:
+      - mathenymanor
+
   agent_api:
     build: ./agent_api
     container_name: agent-api
@@ -93,8 +103,6 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-https://agents.mathenymanor.com}
     restart: unless-stopped
-    depends_on:
-      - redis
     networks:
       - mathenymanor
 
