@@ -74,9 +74,11 @@ services:
     ports:
       - "8091:8091"
     volumes:
-      - /media/nasdrive/mail_intelligence/minio/mail-raw/inbox:/data
+      - /opt/mathenymanor/volumes/rclone-mail:/config/rclone
+    environment:
+      - RCLONE_CONFIG=/config/rclone/rclone.conf
     command: >
-      serve webdav /data
+      serve webdav minio_mail:mail-raw/inbox
       --addr :8091
       --user mailuser
       --pass ${RCLONE_MAIL_PASS}
@@ -87,9 +89,9 @@ services:
       --vfs-cache-max-size 10G
       --vfs-cache-max-age 12h
       --allow-origin "*"
-      --read-only=false
     networks:
       - mathenymanor
+      - core_data_net
 
   agent_api:
     build: ./agent_api
