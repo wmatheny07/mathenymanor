@@ -104,9 +104,15 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - FRONTEND_ORIGIN=${FRONTEND_ORIGIN:-https://agents.mathenymanor.com}
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
     restart: unless-stopped
     networks:
       - mathenymanor
+      - core_data_net
 
   agent_web:
     build:

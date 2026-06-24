@@ -9,326 +9,418 @@ from dotenv import load_dotenv
 import json
 import redis
 import logging
-from datetime import datetime, timezone  # ✅ needed for timestamps
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, timezone
 
 load_dotenv(dotenv_path="/opt/config/runtime/.env.all")
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
-CORS(app, resources={r"/agents/*": {"origins": "https://agents.mathenymanor.com"}})
-#CORS(app, resources={r"/api/agents/*": {"origins": "http://localhost:3001"}})
+CORS(app, origins=["https://agents.mathenymanor.com"])
 
-# Prefer env var, but fall back to docker service name `redis`
+# ── Redis ─────────────────────────────────────────────────────────────────────
+
 REDIS_URL = os.getenv("REDIS_URL") or "redis://redis:6379/0"
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+STREAM_TTL = 60 * 60 * 24 * 7
 
-if not REDIS_URL:
-    raise RuntimeError("REDIS_URL is not set and no default provided")
+# ── Anthropic ─────────────────────────────────────────────────────────────────
 
-redis_client = redis.from_url(
-    REDIS_URL,
-    decode_responses=True,
-)
+claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-SESSION_PREFIX = "agent:caringbridge:session:"
-PROMPTASSIST_PREFIX = "agent:promptassist:session:"
-SESSION_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
+# ── Postgres ──────────────────────────────────────────────────────────────────
 
-# Initialize Anthropic client
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+DB_HOST     = os.getenv("DB_HOST", "postgres")
+DB_PORT     = int(os.getenv("DB_PORT", "5432"))
+DB_NAME     = os.getenv("DB_NAME", "analytics")
+DB_USER     = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DEV_USER    = os.getenv("DEV_USER_EMAIL", "dev@mathenymanor.local")
 
-def load_session_with_prefix(prefix: str, session_id: str) -> dict:
-    key = prefix + session_id
-    raw = redis_client.get(key)
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
 
-def save_session_with_prefix(prefix: str, session_id: str, state: dict) -> None:
-    key = prefix + session_id
-    state.setdefault(
-        "updatedAt",
-        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+def get_db():
+    return psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD, connect_timeout=5,
     )
-    redis_client.setex(key, SESSION_TTL_SECONDS, json.dumps(state))
 
-def load_session(session_id: str) -> dict:
-    """Load session state from Redis, or return empty dict if none."""
-    key = SESSION_PREFIX + session_id
-    raw = redis_client.get(key)
-    if not raw:
-        return {}
+
+def ensure_schema():
+    conn = None
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE SCHEMA IF NOT EXISTS agents;
+
+                CREATE TABLE IF NOT EXISTS agents.conversations (
+                    id         SERIAL PRIMARY KEY,
+                    user_email TEXT        NOT NULL,
+                    agent_type TEXT        NOT NULL,
+                    title      TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_conv_user
+                    ON agents.conversations (user_email, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS agents.messages (
+                    id              SERIAL PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL
+                        REFERENCES agents.conversations(id) ON DELETE CASCADE,
+                    role            TEXT NOT NULL,
+                    content         TEXT NOT NULL,
+                    display_content TEXT,
+                    metadata        JSONB,
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_msg_conv
+                    ON agents.messages (conversation_id, created_at);
+            """)
+        conn.commit()
+        app.logger.info("Agent schema ready.")
+    except Exception as e:
+        app.logger.warning(f"Could not ensure schema (postgres may not be ready): {e}")
+    finally:
+        if conn:
+            conn.close()
 
 
-def save_session(session_id: str, state: dict) -> None:
-    """Save session state into Redis with TTL."""
-    key = SESSION_PREFIX + session_id
-    state.setdefault(
-        "updatedAt",
-        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    )
-    redis_client.setex(key, SESSION_TTL_SECONDS, json.dumps(state))
+# ── Agent configs ─────────────────────────────────────────────────────────────
+
+AGENTS = {
+    "blogpost": {
+        "system": (
+            "You are compassionate, warm, clear, and accurate. "
+            "You help families write CaringBridge-style updates that are "
+            "honest about the medical journey but also hopeful and grateful."
+        ),
+    },
+    "promptassist": {
+        "system": (
+            "You are an expert at crafting precise, effective prompts. "
+            "Follow the user's guidance exactly. No follow-up questions."
+        ),
+    },
+}
 
 
-@app.route("/api/agents/blogpost", methods=["POST"])
-def start_blog_post():
+def build_first_user_message(agent_type: str, display_content: str, metadata: dict) -> str:
+    """Build the full Claude-facing message for the first turn of a conversation."""
+    if agent_type == "blogpost":
+        tone = metadata.get("tone", "hopeful")
+        return (
+            f"You are helping my wife communicate updates about her ongoing cancer treatment "
+            f"for choriocarcinoma.\n"
+            f"Write a CaringBridge-style blog post with a {tone} tone from her perspective. "
+            f"Provide a title for the blog post and also provide Facebook post text that can be "
+            f"used when sharing on social media. Finally, close each blog post with #AmandaStrong.\n\n"
+            f"Notes:\n{display_content}"
+        )
+    # For promptassist, the frontend sends the pre-built structured prompt as display_content
+    return display_content
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_user_email() -> str:
+    return request.headers.get("CF-Access-Authenticated-User-Email") or DEV_USER
+
+
+def row_to_dict(row) -> dict:
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, datetime):
+            d[k] = v.isoformat()
+    return d
+
+
+def save_message(conn, conversation_id: int, role: str, content: str,
+                 display_content: str = None, metadata: dict = None) -> dict:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            INSERT INTO agents.messages
+                (conversation_id, role, content, display_content, metadata)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, role, content, display_content, metadata, created_at
+        """, (
+            conversation_id, role, content, display_content,
+            json.dumps(metadata) if metadata else None,
+        ))
+        row = row_to_dict(cur.fetchone())
+        cur.execute(
+            "UPDATE agents.conversations SET updated_at = NOW() WHERE id = %s",
+            (conversation_id,),
+        )
+    return row
+
+
+def load_claude_history(conn, conversation_id: int) -> list[dict]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("""
+            SELECT role, content FROM agents.messages
+            WHERE conversation_id = %s ORDER BY created_at
+        """, (conversation_id,))
+        return [{"role": r["role"], "content": r["content"]} for r in cur.fetchall()]
+
+
+# ── Conversation endpoints ────────────────────────────────────────────────────
+
+@app.route("/api/conversations", methods=["POST"])
+def create_conversation():
+    user_email = get_user_email()
     data = request.get_json() or {}
-    notes = data.get("notes", "")
-    tone = data.get("tone", "hopeful")
-    session_id = data.get("sessionId") or str(uuid.uuid4())
+    agent_type = data.get("agent_type", "")
+    if agent_type not in AGENTS:
+        return jsonify({"error": "Invalid agent_type"}), 400
 
-    # 1) Load / init session state
-    session_state = load_session(session_id)
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO agents.conversations (user_email, agent_type)
+                VALUES (%s, %s)
+                RETURNING id, agent_type, title, created_at, updated_at
+            """, (user_email, agent_type))
+            row = row_to_dict(cur.fetchone())
+        conn.commit()
+        return jsonify(row), 201
+    except Exception as e:
+        app.logger.exception(f"create_conversation error: {e}")
+        return jsonify({"error": "Server error"}), 500
+    finally:
+        if conn:
+            conn.close()
 
-    prompt = f"""
-You are helping my wife communicate updates about her ongoing cancer treatment for choriocarcinoma.
-Write a CaringBridge-style blog post with a {tone} tone from her perspective. Provide a title for the blog post and also provide Facebook
-post text that can be used when sharing on social media. Finally, close each blog post with #AmandaStrong.
 
-Notes:
-{notes}
-""".strip()
+@app.route("/api/conversations", methods=["GET"])
+def list_conversations():
+    user_email = get_user_email()
+    agent_type = request.args.get("agent")
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            params = [user_email]
+            agent_filter = "AND c.agent_type = %s" if agent_type else ""
+            if agent_type:
+                params.append(agent_type)
+            cur.execute(f"""
+                SELECT c.id, c.agent_type, c.title, c.updated_at,
+                    (SELECT COALESCE(display_content, content)
+                     FROM agents.messages
+                     WHERE conversation_id = c.id AND role = 'user'
+                     ORDER BY created_at LIMIT 1) AS preview
+                FROM agents.conversations c
+                WHERE c.user_email = %s {agent_filter}
+                ORDER BY c.updated_at DESC
+                LIMIT 50
+            """, params)
+            rows = [row_to_dict(r) for r in cur.fetchall()]
+        return jsonify({"conversations": rows}), 200
+    except Exception as e:
+        app.logger.exception(f"list_conversations error: {e}")
+        return jsonify({"conversations": []}), 200
+    finally:
+        if conn:
+            conn.close()
 
-    messages = session_state.get("messages", [])
-    messages.append({"role": "user", "content": prompt})
-    session_state["messages"] = messages
 
-    # 2) reset streaming state
-    session_state["content"] = ""
-    session_state["done"] = False
-    session_state["tone"] = tone
-    session_state["notes"] = notes
-    save_session(session_id, session_state)
+@app.route("/api/conversations/<int:conv_id>", methods=["GET"])
+def get_conversation(conv_id):
+    user_email = get_user_email()
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, agent_type, title, created_at, updated_at
+                FROM agents.conversations
+                WHERE id = %s AND user_email = %s
+            """, (conv_id, user_email))
+            conv = cur.fetchone()
+            if not conv:
+                return jsonify({"error": "Not found"}), 404
+            cur.execute("""
+                SELECT id, role, content, display_content, metadata, created_at
+                FROM agents.messages
+                WHERE conversation_id = %s
+                ORDER BY created_at
+            """, (conv_id,))
+            messages = [row_to_dict(r) for r in cur.fetchall()]
+        result = row_to_dict(conv)
+        result["messages"] = messages
+        return jsonify(result), 200
+    except Exception as e:
+        app.logger.exception(f"get_conversation {conv_id} error: {e}")
+        return jsonify({"error": "Server error"}), 500
+    finally:
+        if conn:
+            conn.close()
 
-    def generate_chunks(session_id: str):
-        local_state = load_session(session_id) or {}
-        local_messages = local_state.get("messages", [])
 
-        app.logger.info(f"[blogpost] START generation for {session_id}")
+@app.route("/api/conversations/<int:conv_id>", methods=["DELETE"])
+def delete_conversation(conv_id):
+    user_email = get_user_email()
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM agents.conversations WHERE id = %s AND user_email = %s",
+                (conv_id, user_email),
+            )
+        conn.commit()
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        app.logger.exception(f"delete_conversation {conv_id} error: {e}")
+        return jsonify({"ok": False}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# ── Message send + streaming ──────────────────────────────────────────────────
+
+@app.route("/api/conversations/<int:conv_id>/messages", methods=["POST"])
+def send_message(conv_id):
+    user_email = get_user_email()
+    data = request.get_json() or {}
+    display_content = (data.get("content") or "").strip()
+    metadata = data.get("metadata") or {}
+    is_first = bool(data.get("is_first", False))
+
+    if not display_content:
+        return jsonify({"error": "Missing content"}), 400
+
+    conn = None
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, agent_type FROM agents.conversations WHERE id = %s AND user_email = %s",
+                (conv_id, user_email),
+            )
+            conv = cur.fetchone()
+        if not conv:
+            return jsonify({"error": "Not found"}), 404
+
+        agent_type = conv["agent_type"]
+
+        # Build the content Claude actually receives
+        if is_first:
+            claude_content = build_first_user_message(agent_type, display_content, metadata)
+            # Auto-title from first message
+            title = display_content[:60].rstrip()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE agents.conversations SET title = %s WHERE id = %s",
+                    (title, conv_id),
+                )
+        else:
+            claude_content = display_content
+
+        # Save user message (content = what Claude sees, display_content = what UI shows)
+        user_msg = save_message(
+            conn, conv_id, "user",
+            content=claude_content,
+            display_content=display_content,
+            metadata=metadata if is_first else None,
+        )
+
+        # Load full history for Claude within the same transaction so the
+        # just-inserted row is included without needing a second round-trip.
+        history = load_claude_history(conn, conv_id)
+        conn.commit()
+
+    except Exception as e:
+        app.logger.exception(f"send_message {conv_id} error: {e}")
+        return jsonify({"error": "Server error"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+    session_id = str(uuid.uuid4())
+    stream_key = f"agent:stream:{session_id}"
+    redis_client.setex(stream_key, STREAM_TTL, json.dumps({"content": "", "done": False}))
+
+    system_prompt = AGENTS[agent_type]["system"]
+
+    def generate(conv_id: int, session_id: str, history: list, system_prompt: str):
+        stream_key = f"agent:stream:{session_id}"
+        state = {"content": "", "done": False}
+        full_text = ""
 
         try:
-            completion = client.messages.create(
+            completion = claude.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
-                system=(
-                    "You are compassionate, warm, clear, and accurate. "
-                    "You help families write CaringBridge-style updates that are "
-                    "honest about the medical journey but also hopeful and grateful."
-                ),
-                messages=local_messages,
+                system=system_prompt,
+                messages=history,
             )
-
-            full_text = completion.content[0].text.strip()
-            chunk_size = 150
-            chunks = [
-                full_text[i : i + chunk_size]
-                for i in range(0, len(full_text), chunk_size)
-            ]
-
-            content = local_state.get("content", "")
-            app.logger.info(
-                f"[blogpost] Generated {len(full_text)} chars "
-                f"in {len(chunks)} chunks for {session_id}"
-            )
-
-            for idx, chunk in enumerate(chunks):
-                content += chunk
-                local_state["content"] = content
-                local_state["done"] = False
-                save_session(session_id, local_state)
-                app.logger.info(
-                    f"[blogpost] Saved chunk {idx+1}/{len(chunks)} for {session_id} "
-                    f"(content_len={len(content)})"
-                )
-                time.sleep(0.2)
-
-            app.logger.info(f"[blogpost] FINISHED streaming for {session_id}")
-
-        except Exception as e:
-            app.logger.exception(f"[blogpost] ERROR during generation for {session_id}: {e}")
-            content = local_state.get("content", "")
-            content += f"\n\n[ERROR generating blog post: {e}]"
-            local_state["content"] = content
-
-        finally:
-            app.logger.info(f"[blogpost] Marking {session_id} done=True in finally")
-            local_state["done"] = True
-            try:
-                save_session(session_id, local_state)
-                app.logger.info(f"[blogpost] Saved final state for {session_id}")
-            except Exception as e:
-                app.logger.exception(
-                    f"[blogpost] FAILED to save final state for {session_id}: {e}"
-                )
-
-    threading.Thread(target=generate_chunks, args=(session_id,), daemon=True).start()
-    return jsonify({"session_id": session_id}), 200
-
-
-@app.route("/api/agents/blogpost/<session_id>", methods=["GET"])
-def get_blog_post_chunk(session_id):
-    session_state = load_session(session_id)
-
-    if not session_state:
-        # still initializing or state missing – treat as "not done yet"
-        return jsonify(
-            {
-                "content": "",
-                "done": False,
-                "updatedAt": None,
-            }
-        ), 200
-
-    app.logger.info(
-        f"[blogpost] GET chunk for {session_id} | done={session_state.get('done')} | "
-        f"content_len={len(session_state.get('content', ''))}"
-    )
-
-    return jsonify(
-        {
-            "content": session_state.get("content", ""),
-            "done": bool(session_state.get("done", False)),
-            "updatedAt": session_state.get("updatedAt"),
-        }
-    ), 200
-
-@app.route("/api/agents/promptassist", methods=["POST"])
-def start_promptassist():
-    data = request.get_json() or {}
-
-    # Expect the frontend to send the final composed prompt
-    prompt = (data.get("prompt") or "").strip()
-
-    # Optional: structured fields (nice for debugging / saving)
-    persona = data.get("persona", "")
-    tone = data.get("tone", "professional")
-    request_text = data.get("request", "")
-    context = data.get("context", "")
-    constraints = data.get("constraints", "")
-    output_format = data.get("outputFormat", "")
-    ask_first = bool(data.get("askFirst", True))
-
-    session_id = data.get("sessionId") or str(uuid.uuid4())
-
-    if not prompt:
-        return jsonify({"error": "Missing 'prompt'"}), 400
-
-    # 1) Load / init session state
-    session_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id)
-
-    messages = session_state.get("messages", [])
-    messages.append({"role": "user", "content": prompt})
-    session_state["messages"] = messages
-
-    # 2) reset streaming state
-    session_state["content"] = ""
-    session_state["done"] = False
-
-    # Save inputs for transparency / debugging
-    session_state["prompt"] = prompt
-    session_state["persona"] = persona
-    session_state["tone"] = tone
-    session_state["request"] = request_text
-    session_state["context"] = context
-    session_state["constraints"] = constraints
-    session_state["outputFormat"] = output_format
-    session_state["askFirst"] = ask_first
-
-    save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, session_state)
-
-    def generate_chunks(session_id: str):
-        local_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id) or {}
-        local_messages = local_state.get("messages", [])
-
-        app.logger.info(f"[promptassist] START generation for {session_id}")
-
-        try:
-            completion = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                system=(
-                    "Please follow the upcoming guidance in providing the optimal response:\n"
-                    "No follow up questions asked, please.\n"
-                ),
-                messages=local_messages,
-            )
-
             full_text = (completion.content[0].text or "").strip()
             chunk_size = 150
-            chunks = [full_text[i : i + chunk_size] for i in range(0, len(full_text), chunk_size)]
-
-            content = local_state.get("content", "")
-            app.logger.info(
-                f"[promptassist] Generated {len(full_text)} chars in {len(chunks)} chunks for {session_id}"
-            )
-
-            for idx, chunk in enumerate(chunks):
+            content = ""
+            for chunk in [full_text[i: i + chunk_size] for i in range(0, len(full_text), chunk_size)]:
                 content += chunk
-                local_state["content"] = content
-                local_state["done"] = False
-                save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, local_state)
-
-                app.logger.info(
-                    f"[promptassist] Saved chunk {idx+1}/{len(chunks)} for {session_id} "
-                    f"(content_len={len(content)})"
-                )
+                state["content"] = content
+                redis_client.setex(stream_key, STREAM_TTL, json.dumps(state))
                 time.sleep(0.2)
 
-            app.logger.info(f"[promptassist] FINISHED streaming for {session_id}")
-
         except Exception as e:
-            app.logger.exception(f"[promptassist] ERROR during generation for {session_id}: {e}")
-            content = local_state.get("content", "")
-            content += f"\n\n[ERROR generating prompt assist response: {e}]"
-            local_state["content"] = content
+            app.logger.exception(f"[generate] error for {session_id}: {e}")
+            state["content"] += f"\n\n[Error: {e}]"
+            full_text = state["content"]
 
         finally:
-            app.logger.info(f"[promptassist] Marking {session_id} done=True in finally")
-            local_state["done"] = True
-            try:
-                save_session_with_prefix(PROMPTASSIST_PREFIX, session_id, local_state)
-                app.logger.info(f"[promptassist] Saved final state for {session_id}")
-            except Exception as e:
-                app.logger.exception(f"[promptassist] FAILED to save final state for {session_id}: {e}")
+            state["done"] = True
+            redis_client.setex(stream_key, STREAM_TTL, json.dumps(state))
+            if full_text and not full_text.startswith("\n\n[Error"):
+                c = None
+                try:
+                    c = get_db()
+                    save_message(c, conv_id, "assistant", content=full_text)
+                    c.commit()
+                except Exception as e:
+                    app.logger.exception(f"Failed to save assistant message: {e}")
+                finally:
+                    if c:
+                        c.close()
 
-    threading.Thread(target=generate_chunks, args=(session_id,), daemon=True).start()
-    return jsonify({"session_id": session_id}), 200
+    threading.Thread(
+        target=generate, args=(conv_id, session_id, history, system_prompt), daemon=True
+    ).start()
+
+    return jsonify({"session_id": session_id, "user_message": user_msg}), 200
 
 
-@app.route("/api/agents/promptassist/<session_id>", methods=["GET"])
-def get_promptassist_chunk(session_id):
-    session_state = load_session_with_prefix(PROMPTASSIST_PREFIX, session_id)
+@app.route("/api/conversations/<int:conv_id>/stream", methods=["GET"])
+def stream_poll(conv_id):
+    session_id = request.args.get("session_id", "")
+    if not session_id:
+        return jsonify({"error": "Missing session_id"}), 400
+    raw = redis_client.get(f"agent:stream:{session_id}")
+    if not raw:
+        return jsonify({"content": "", "done": False}), 200
+    try:
+        state = json.loads(raw)
+    except json.JSONDecodeError:
+        state = {"content": "", "done": False}
+    return jsonify({"content": state.get("content", ""), "done": bool(state.get("done", False))}), 200
 
-    if not session_state:
-        return jsonify({"content": "", "done": False, "updatedAt": None}), 200
 
-    app.logger.info(
-        f"[promptassist] GET chunk for {session_id} | done={session_state.get('done')} | "
-        f"content_len={len(session_state.get('content', ''))}"
-    )
-
-    return jsonify(
-        {
-            "content": session_state.get("content", ""),
-            "done": bool(session_state.get("done", False)),
-            "updatedAt": session_state.get("updatedAt"),
-            # Optional: return the saved prompt too (handy for UI verification)
-            "prompt": session_state.get("prompt", ""),
-        }
-    ), 200
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.route("/api/health", methods=["GET"])
-def health_check():
+def health():
     return jsonify({"status": "ok"}), 200
 
 
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+ensure_schema()
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
-    # For testing
-    #app.run(host="0.0.0.0", port=9999, debug=True)
