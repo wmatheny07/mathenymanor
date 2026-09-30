@@ -41,6 +41,18 @@ services:
         max-file: "1"
     network_mode: host
 
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - TZ=America/New_York
+    volumes:
+      - ./volumes/homeassistant:/config
+      - /run/dbus:/run/dbus:ro
+    network_mode: host
+
   rclone:
     user: "1000:1000"
     image: rclone/rclone:latest
@@ -146,3 +158,13 @@ services:
       - "8088:8000"                          # host:container
     networks:
       - core_data_net
+
+  esphome:
+    image: ghcr.io/esphome/esphome:latest
+    container_name: esphome
+    restart: "no"                            # dashboard has no auth; start it only when building firmware
+    environment:
+      - TZ=America/New_York
+    volumes:
+      - ./volumes/esphome:/config
+    network_mode: host                       # mDNS device discovery; dashboard on :6052

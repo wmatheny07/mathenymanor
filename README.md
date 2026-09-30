@@ -114,6 +114,12 @@ Exposes the NAS media drive as a WebDAV endpoint for remote file access. Full VF
 
 Integrates smart home devices that don't natively support HomeKit into the Apple Home ecosystem. Config and plugin state persisted at `./volumes/homebridge`.
 
+**`homeassistant`** — Home Assistant Core (host network, port 8123)
+
+Central smart home hub for device automations, dashboards, and integrations. Runs with `network_mode: host` and `privileged: true` for mDNS/SSDP device discovery (HomeKit, Sonos, Chromecast, etc.) and local Bluetooth access (`/run/dbus` mounted read-only). Config persisted at `./volumes/homeassistant`.
+
+Reachable externally at `homeassistant.mathenymanor.com` via nginx/Cloudflare, same mTLS pattern as `homebridge` and `plex`.
+
 ---
 
 ### Networking
