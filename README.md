@@ -175,7 +175,9 @@ User (browser)
 
 ## Deployment
 
-Secrets are pulled from 1Password and injected at deploy time via `docker_compose_op.sh`. Runtime env is sourced from `/opt/config/runtime/.env.all`.
+Deploy with `/opt/util/stack.sh -f docker-compose.mathenymanor.yml -e /opt/config/runtime/.env.all -p mathenymanor up`. On each run, `stack.sh` pulls secrets from 1Password by running `op inject` on the template `/opt/config/project/.env.all` and writes the result to `/opt/config/runtime/.env.all`. The runtime file is cleared on `down`, so it's normal for it to be empty between runs. To add or change a secret, edit its `op://` reference in `/opt/config/project/.env.all`.
+
+`docker_compose_op.sh` is legacy and shouldn't be used. It overwrites `/opt/config/.env` with only `OPENAI`, then deletes it.
 
 Key environment variables:
 
